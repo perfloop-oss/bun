@@ -4379,6 +4379,9 @@ JSC::JSPromise* GlobalObject::moduleLoaderImportModule(JSGlobalObject* jsGlobalO
     globalObject->onResolvePlugins.isResolvingImportCall = false;
     if (scope.exception()) [[unlikely]]
         return JSC::JSPromise::rejectedPromiseWithCaughtException(globalObject, scope);
+    // Ahead of the load, which can throw inside this call: a caller that catches that keeps its fallback, and counts as one that called.
+    if (isBunTest) [[unlikely]]
+        Bun::didCallImport(globalObject, loader, sourceURL.protocolIsFile() ? referrer.string() : String(), key.string());
 
     if (Bun::hasCompiledModules() && !Bun::moduleGraphOfLoader(globalObject, loader)) [[unlikely]] {
         Bun::willRequire(globalObject, moduleNameValue, JSC::AOT::LoadKind::Import);
