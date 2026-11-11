@@ -10,6 +10,7 @@ mod parents;
 mod runtime;
 pub mod static_referent;
 
+pub use binder::module_instance_state;
 pub use closed_module::specifiers_of_closed_module;
 pub use parents::{bind_for_format_in, try_bind_for_format_in};
 pub use runtime::{

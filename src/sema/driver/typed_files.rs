@@ -1298,6 +1298,13 @@ impl Mappings {
         Ok(Mappings { entries })
     }
 
+    /// The source that the nearest entry at or before `generated` names. Not every token has an
+    /// entry of its own: the first of `export default <expression>` has none.
+    fn source_before(&self, generated: u32) -> Option<u32> {
+        let until = self.entries.partition_point(|entry| entry.0 <= generated);
+        self.entries[..until].last().map(|entry| entry.1)
+    }
+
     fn original(&self, generated: u32) -> Option<(u32, u32)> {
         let until = self.entries.partition_point(|entry| entry.0 <= generated);
         let last = self.entries[..until]
@@ -1551,8 +1558,17 @@ struct Declared {
     type_parameters: usize,
     import: Option<(StmtId, ImportedAs)>,
     is_ambient_value: bool,
+    /// One of `statements` is a namespace. `Syntax::has_value` says whether it makes an object.
+    is_erased_namespace: bool,
     is_function: bool,
     is_default_expression: bool,
+}
+
+impl Declared {
+    /// An import is a binding that is not one of `names`.
+    fn has_no_binding_of_its_own(&self) -> bool {
+        self.bindings.iter().all(|at| !self.names.contains(at))
+    }
 }
 
 impl<'a, 's> Syntax<'a, 's> {
@@ -1902,6 +1918,8 @@ impl<'a, 's> Syntax<'a, 's> {
                     true => entry.statements.push(id),
                     false => entry.bindings.push(at),
                 }
+                entry.is_erased_namespace |=
+                    is_type_only && matches!(statement.kind, StmtKind::Module(_));
                 entry.is_ambient_value |= is_type_only
                     && matches!(
                         statement.kind,
@@ -1919,6 +1937,19 @@ impl<'a, 's> Syntax<'a, 's> {
             }
         }
         declared
+    }
+
+    /// Whether a name that has no binding is a value still: an ambient variable, function, class
+    /// or enum, or a namespace that TypeScript makes an object of.
+    fn has_value(&self, found: &Declared) -> bool {
+        use bun_sema::bind::{ModuleInstanceState, module_instance_state};
+        let file = self.file;
+        found.is_ambient_value
+            || found.statements.iter().any(|&statement| {
+                matches!(file[statement].kind, StmtKind::Module(module)
+                    if module_instance_state(file, self.text, module, &[file.body])
+                        != ModuleInstanceState::NonInstantiated)
+            })
     }
 }
 
@@ -1943,6 +1974,8 @@ struct Linked {
     ambient_enums: FxHashSet<(usize, u32)>,
     ambient_signatures: FxHashSet<(usize, u32)>,
     replaced_statements: FxHashSet<(usize, u32)>,
+    /// The statements of the names that `link` pins: see `is_pinned` there.
+    pinned_statements: FxHashSet<(usize, u32)>,
     modules_of_untyped_values: Vec<Vec<u8>>,
     emitted_enums: FxHashMap<(u32, u32), Vec<u8>>,
     enum_names: FxHashMap<(u32, u32), Vec<u8>>,
@@ -2167,6 +2200,28 @@ fn link(
         .into_iter()
         .map(|at| output.word(at))
         .collect();
+    // The identifiers that nothing in the output declares or imports, each with the source whose
+    // text it is printed in, or `None` where no entry of the source map comes before it.
+    let free_reads: std::cell::OnceCell<FxHashSet<(Option<u32>, &[u8])>> =
+        std::cell::OnceCell::new();
+    let is_read_by = |index: usize, name: &[u8], is_script: bool| {
+        let reads = free_reads.get_or_init(|| {
+            let imported: FxHashSet<&[u8]> =
+                (output.imported_names().map(|at| output.word(at))).collect();
+            let free = output.used_names().filter_map(|at| {
+                let name = output.word(at);
+                let is_bound = declared_in_output.contains(name) || imported.contains(name);
+                (!is_bound).then(|| (mappings.source_before(at), name))
+            });
+            free.collect()
+        });
+        match is_script {
+            true => reads.iter().any(|read| read.1 == name),
+            false => [Some(index as u32), None]
+                .iter()
+                .any(|&reader| reads.contains(&(reader, name))),
+        }
+    };
     let mut names: Vec<FxHashMap<&[u8], Vec<u8>>> = vec![FxHashMap::default(); written.len()];
     let mut values: Vec<FxHashMap<&[u8], &[u8]>> = vec![FxHashMap::default(); written.len()];
     let mut imports: FxHashMap<Vec<u8>, Vec<u8>> = FxHashMap::default();
@@ -2294,6 +2349,25 @@ fn link(
             {
                 continue;
             }
+            // The JavaScript cannot follow a new name. So a value that no statement of the output
+            // makes keeps its name where the JavaScript of its module reads that name, and is
+            // free to get another one everywhere else. What a script declares, every module reads.
+            let is_pinned = (found.is_ambient_value || found.is_erased_namespace)
+                && found.has_no_binding_of_its_own()
+                && !emitted_from.contains_key(&index)
+                && taken.contains(name)
+                && is_read_by(index, name, !module.syntax.file.has_module_syntax)
+                && module.syntax.has_value(found);
+            if is_pinned {
+                let pinned = found.statements.iter();
+                linked
+                    .pinned_statements
+                    .extend(pinned.map(|statement| (index, statement.0)));
+            }
+            let name_to_write = |taken: &mut FxHashSet<Vec<u8>>| match is_pinned {
+                true => name.to_vec(),
+                false => unique(name, taken),
+            };
             if let Some((statement, imported_as)) = found.import {
                 let (file, statement) = (module.syntax.file, &module.syntax.file[statement]);
                 let StmtKind::Import(import) = statement.kind else {
@@ -2307,7 +2381,7 @@ fn link(
                     continue;
                 }
                 if is_relative {
-                    names[index].insert(name, unique(name, &mut taken));
+                    names[index].insert(name, name_to_write(&mut taken));
                     continue;
                 }
                 let imported = match imported_as {
@@ -2318,11 +2392,14 @@ fn link(
                     }
                 };
                 let key = [imported, b" ", tail].concat();
-                if let Some(known) = imports.get(&key) {
+                if let Some(known) = imports
+                    .get(&key)
+                    .filter(|known| !is_pinned || &known[..] == name)
+                {
                     names[index].insert(name, known.clone());
                     continue;
                 }
-                let local = unique(name, &mut taken);
+                let local = name_to_write(&mut taken);
                 let clause = match imported_as {
                     ImportedAs::Default => local.clone(),
                     ImportedAs::Namespace => [&b"* as "[..], &local[..]].concat(),
@@ -2349,12 +2426,7 @@ fn link(
                 names[index].insert(name, local);
                 continue;
             }
-            if found.is_ambient_value
-                && found.bindings.is_empty()
-                && !emitted_from.contains_key(&index)
-                && !declared_in_output.contains(name)
-            {
-                taken.insert(name.to_vec());
+            if is_pinned {
                 names[index].insert(name, name.to_vec());
                 continue;
             }
@@ -2448,9 +2520,10 @@ fn link(
         let is_only_a_type = |target: &Target| {
             place_of(target)
                 .and_then(|(index, name)| {
+                    let syntax = &written[index].as_ref()?.syntax;
                     declared[index]
                         .get(&name[..])
-                        .map(|found| found.bindings.is_empty() && !found.is_ambient_value)
+                        .map(|found| found.bindings.is_empty() && !syntax.has_value(found))
                 })
                 .unwrap_or(false)
         };
@@ -3576,7 +3649,9 @@ impl<'a> Transfer<'_, 'a, '_> {
             self.linked,
         );
         let (output_file, insertions) = (output.file, &mut self.insertions);
-        let mut ambient_values: FxHashSet<&[u8]> = FxHashSet::default();
+        // An ambient variable by the name it is written under, any other pinned statement by its
+        // text: several modules can declare the one value that they all read.
+        let mut written_once: FxHashSet<Vec<u8>> = FxHashSet::default();
         let output_identifiers: FxHashSet<&[u8]> =
             output.used_names().map(|at| output.word(at)).collect();
         let mut output_statements: FxHashMap<(u32, u32), u32> = FxHashMap::default();
@@ -3644,15 +3719,16 @@ impl<'a> Transfer<'_, 'a, '_> {
                             declarations.iter().for_each(|declaration: VarDeclId| {
                                 syntax.identifiers(file[declaration].pat, &mut names)
                             });
-                            let is_referenced = |name: &[u8]| {
-                                output_identifiers.contains(name)
+                            let mut is_new = false;
+                            for &at in &names {
+                                let name = syntax.word(at);
+                                let written = module.text(at, syntax.token_end(at));
+                                let is_read = written == name && output_identifiers.contains(name);
+                                let is_referenced = is_read
                                     || module.types.is_none_or(|types| {
                                         self.type_references.contains(&(&types.path[..], name))
-                                    })
-                            };
-                            let mut is_new = false;
-                            for name in names.iter().map(|&name| syntax.word(name)) {
-                                is_new |= is_referenced(name) && ambient_values.insert(name);
+                                    });
+                                is_new |= is_referenced && written_once.insert(written);
                             }
                             if !is_new {
                                 continue;
@@ -3679,7 +3755,12 @@ impl<'a> Transfer<'_, 'a, '_> {
                             }
                         }
                         _ if syntax.is_type_only_statement(id) => {
-                            module.statement_text(id, Flags::EXPORT | Flags::DEFAULT)
+                            let text = module.statement_text(id, Flags::EXPORT | Flags::DEFAULT);
+                            let is_pinned = linked.pinned_statements.contains(&(index, id.0));
+                            if is_pinned && !written_once.insert(text.clone()) {
+                                continue;
+                            }
+                            text
                         }
                         _ => continue,
                     };
