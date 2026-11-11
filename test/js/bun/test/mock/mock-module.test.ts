@@ -7710,7 +7710,7 @@ describe.concurrent("a module whose top-level code mocks through a function of a
     );
   });
 
-  // The function of register.cjs gets the arguments that the body of a CommonJS module gets.
+  // The function of register.cjs gets the arguments that the body of a CommonJS module gets: the first three, then all five.
   test("is run again without a module whose function is handed its module object", async () => {
     await expectFixturesToPass(
       {
@@ -7725,7 +7725,9 @@ describe.concurrent("a module whose top-level code mocks through a function of a
         `,
         "setup.cjs": `
           ${count("setup")}
-          require("./register.cjs")(exports, require, module);
+          const register = require("./register.cjs");
+          register(exports, require, module);
+          register(exports, require, module, __filename, __dirname);
         `,
         ...testFiles(`import "./setup.cjs";`, { wrapper: 1, setup: 2, register: 1 }),
       },
