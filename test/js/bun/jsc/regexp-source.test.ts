@@ -1,10 +1,12 @@
 import { heapStats } from "bun:jsc";
 import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe } from "harness";
+import { join } from "node:path";
 
-// A RegExp keeps the text of `source` from the first read: the engine escapes the pattern once
+// A RegExp keeps the string of `source` from the first read: the engine escapes the pattern once
 // and every later read returns the same string. Before, each read escaped the pattern again and
-// made a new string.
+// made a new string. The first case and the last one pin that difference. The others pin what
+// has to stay the same: the values, the receivers, compile() and the collector.
 
 // The pattern text, and the `source` of a RegExp made from it.
 const cases: [string, string][] = [
@@ -121,31 +123,34 @@ describe("RegExp.prototype.source", () => {
     expect(new RegExp(regExp).source).toBe("print\\/me");
   });
 
-  // The heap snapshot names a RegExp by its source. It asks the engine for the text, not for a
-  // string cell, and it is the first to ask here. In a child: a snapshot of this process is slow.
-  test("a heap snapshot names a RegExp before anything read its source", async () => {
-    const program = `
-      const regExp = new RegExp("heap/snapshot-" + "name");
-      const before = JSON.parse(Bun.generateHeapSnapshot("v8")).strings.includes("/heap\\\\/snapshot-name/");
-      const source = regExp.source;
-      const after = JSON.parse(Bun.generateHeapSnapshot("v8")).strings.includes("/heap\\\\/snapshot-name/");
-      console.log(JSON.stringify({ before, source, again: regExp.source, after }));
-    `;
+  // A heap snapshot names a RegExp by its source and says how large its engine cell is. The
+  // snapshot asks the engine for the text, not for the kept string: it must leave nothing on a
+  // RegExp that it names. A read of `source` adds the two words of the struct that keeps the
+  // string. In a child: a snapshot of this process is slow.
+  test("a heap snapshot names a RegExp by its source and keeps nothing on it", async () => {
     await using proc = Bun.spawn({
-      cmd: [bunExe(), "-e", program],
+      cmd: [bunExe(), join(import.meta.dir, "regexp-source-heap-snapshot-fixture.ts")],
       env: bunEnv,
       stdout: "pipe",
       stderr: "pipe",
     });
     const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
-    expect({ stdout: stdout.trim(), stderr }).toEqual({
-      stdout: JSON.stringify({
-        before: true,
-        source: "heap\\/snapshot-name",
-        again: "heap\\/snapshot-name",
-        after: true,
-      }),
-      stderr: "",
+    expect(stderr).toBe("");
+    const { before, sources, after } = JSON.parse(stdout);
+    const size = before[0].size;
+    expect(size).toBeGreaterThan(0);
+    expect({ before, sources, after }).toEqual({
+      before: [
+        { count: 1, size },
+        { count: 1, size },
+        { count: 1, size },
+      ],
+      sources: ["heap-snapshot-clean-name", "heap\\/snapshot-escaped-nam"],
+      after: [
+        { count: 1, size: size + 16 },
+        { count: 1, size: size + 16 },
+        { count: 1, size },
+      ],
     });
     expect(exitCode).toBe(0);
   });

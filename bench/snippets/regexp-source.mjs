@@ -1,3 +1,4 @@
+import fastDeepEqual from "fast-deep-equal/es6/index";
 import { bench, run } from "../runner.mjs";
 
 const literal = /foo+bar/;
@@ -50,6 +51,18 @@ bench("a.source === b.source (two different routes)", () => {
 
 bench("String(regExp)", () => {
   sink += String(literalRoute).length;
+});
+
+// The literal makes a new object each time. All of them share one engine RegExp, and so one source.
+bench("/x+y/.source, the literal evaluated each time", () => {
+  sink += /x+y/.source.length;
+});
+
+// fast-deep-equal compares two RegExps by `source` and `flags`: four reads of `source` here.
+const left = { id: 1, route: /^\/users\/(\d+)$/, nested: { filter: /foo+bar/gi } };
+const right = { id: 1, route: /^\/users\/(\d+)$/, nested: { filter: /foo+bar/gi } };
+bench("fast-deep-equal, two objects with two RegExps each", () => {
+  sink += fastDeepEqual(left, right) ? 1 : 0;
 });
 
 let counter = 0;
