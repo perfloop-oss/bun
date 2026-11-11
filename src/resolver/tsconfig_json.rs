@@ -117,7 +117,8 @@ impl JsonCache {
 pub(crate) type PathsMap = ArrayHashMap<Box<[u8]>, Vec<Box<[u8]>>>;
 
 pub struct TSConfigJSON {
-    pub(crate) abs_path: Box<[u8]>,
+    /// The file that was asked for, also with `extends`. `name_files_under` names it by the real path of its directory.
+    pub abs_path: Box<[u8]>,
 
     /// The absolute path of "compilerOptions.baseUrl"
     pub(crate) base_url: Box<[u8]>,
@@ -140,6 +141,8 @@ pub struct TSConfigJSON {
 
     /// What `compilerOptions` states about JSX, laid over what the configs it extends state.
     pub jsx: options::jsx::Stated,
+    /// With `extends`: each file that `jsx` merges and what that file states, the base first and this file last.
+    pub jsx_of_files: Vec<(Box<[u8]>, options::jsx::Stated)>,
 
     pub(crate) preserve_imports_not_used_as_values: Option<bool>,
 
@@ -165,6 +168,7 @@ impl Default for TSConfigJSON {
             extends: Box::default(),
             paths: PathsMap::default(),
             jsx: options::jsx::Stated::default(),
+            jsx_of_files: Vec::new(),
             preserve_imports_not_used_as_values: Some(false),
             emit_decorator_metadata: false,
             experimental_decorators: false,
@@ -215,6 +219,34 @@ impl TSConfigJSON {
 
     pub(crate) fn has_base_url(&self) -> bool {
         !self.base_url.is_empty()
+    }
+
+    /// Names the files of `jsx_by_file` under `real`, the real path of the directory `asked`: one name for a file, however its directory is asked for.
+    pub(crate) fn name_files_under(&mut self, asked: &[u8], real: &[u8]) {
+        use bun_paths::resolve_path::{join_abs_string_buf_checked, platform, relative};
+        let mut buf = bun_paths::path_buffer_pool::get();
+        let mut name = |file: &mut Box<[u8]>| {
+            let below = relative(asked, file).to_vec();
+            let named =
+                join_abs_string_buf_checked::<platform::Auto>(real, &mut buf[..], &[&below]);
+            if let Some(named) = named {
+                *file = Box::from(named);
+            }
+        };
+        name(&mut self.abs_path);
+        for (file, _) in &mut self.jsx_of_files {
+            name(file);
+        }
+    }
+
+    /// Each file that `jsx` merges, with what that file states: the base of `extends` first.
+    pub fn jsx_by_file(&self) -> impl Iterator<Item = (&[u8], &options::jsx::Stated)> {
+        let alone = self
+            .jsx_of_files
+            .is_empty()
+            .then_some((&*self.abs_path, &self.jsx));
+        let merged = self.jsx_of_files.iter().map(|(path, jsx)| (&**path, jsx));
+        alone.into_iter().chain(merged)
     }
 
     pub(crate) fn abs_base_url_for_paths(&self) -> &[u8] {
@@ -805,7 +837,7 @@ mod tests {
     use bun_sema_standalone as _;
 
     use super::*;
-    use options::jsx::{MemberList, Runtime};
+    use options::jsx::{MemberList, Runtime, Stated};
 
     /// The config of `{"compilerOptions": <compiler_options>}` and the number of warnings it logs.
     fn parse(compiler_options: &str) -> (Box<TSConfigJSON>, u32) {
@@ -864,5 +896,26 @@ mod tests {
         let (config, warnings) = parse(r#"{"jsxFactory": "1x.y"}"#);
         assert!(config.jsx.states_nothing());
         assert_eq!(warnings, 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn files_are_named_under_the_real_path_of_the_directory() {
+        let file = |path: &[u8]| (Box::from(path), Stated::default());
+        let mut config = TSConfigJSON {
+            abs_path: Box::from(&b"/link/app/tsconfig.json"[..]),
+            jsx_of_files: vec![file(b"/link/base.json"), file(b"/link/app/tsconfig.json")],
+            ..Default::default()
+        };
+        config.name_files_under(b"/link/app", b"/real/app");
+        let files: Vec<&[u8]> = config.jsx_by_file().map(|(file, _)| file).collect();
+        assert_eq!(files, [&b"/real/base.json"[..], b"/real/app/tsconfig.json"]);
+        assert_eq!(&*config.abs_path, b"/real/app/tsconfig.json");
+
+        // Without `extends` the config is its one file.
+        config.jsx_of_files.clear();
+        config.name_files_under(b"/real/app", b"/other");
+        let files: Vec<&[u8]> = config.jsx_by_file().map(|(file, _)| file).collect();
+        assert_eq!(files, [&b"/other/tsconfig.json"[..]]);
     }
 }
